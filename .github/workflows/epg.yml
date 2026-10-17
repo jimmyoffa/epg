@@ -1,0 +1,122 @@
+name: EPG
+
+on:
+  # Ogni 6 ore (UTC). GitHub valuta i cron in UTC e ignora `timezone`.
+  schedule:
+    - cron: '17 1,7,13,19 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: epg
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install --disable-pip-version-check requests beautifulsoup4
+
+      # Gli strumenti arrivano da una sorgente privata configurata nei secret e
+      # vivono SOLO in $RUNNER_TEMP: non entrano mai nel repo.
+      - name: Prepara strumenti
+        env:
+          GH_TOKEN: ${{ secrets.TOOLS_TOKEN }}
+          REPO: ${{ secrets.TOOLS_REPO }}
+          REF: ${{ secrets.TOOLS_REF }}
+          FILES: ${{ secrets.TOOLS_FILES }}
+        run: |
+          set -euo pipefail
+          API="https://api.github.com/repos/$REPO/contents"
+          gh_fetch() {
+            curl -fsSL \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github.raw" \
+              "$1" -o "$2"
+          }
+          mkdir -p "$RUNNER_TEMP/tools"
+          n=0
+          while IFS= read -r line; do
+            n=$((n+1))
+            line="$(printf '%s' "$line" | tr -d '\r' | xargs)"
+            [ -z "$line" ] && continue
+            # Formato atteso: percorso_sorgente|nome_locale
+            if [[ "$line" == *"|"* ]]; then
+              src="${line%%|*}"
+              dest="${line#*|}"
+            elif [[ "$line" == *" "* ]]; then
+              src="${line%% *}"
+              dest="${line#* }"
+            else
+              echo "::error::TOOLS_FILES: riga $n senza nome locale. Formato atteso: percorso_sorgente|nome_locale"
+              exit 1
+            fi
+            src="$(printf '%s' "$src" | xargs)"
+            dest="$(printf '%s' "$dest" | xargs)"
+            if [ -z "$src" ] || [ -z "$dest" ]; then
+              echo "::error::TOOLS_FILES: riga $n non valida (sorgente o nome locale vuoto)"
+              exit 1
+            fi
+            mkdir -p "$RUNNER_TEMP/tools/$(dirname "$dest")"
+            gh_fetch "$API/$src?ref=$REF" "$RUNNER_TEMP/tools/$dest"
+          done <<< "$FILES"
+          echo "Strumenti scaricati: $(find "$RUNNER_TEMP/tools" -type f | wc -l)"
+
+      - name: Aggiorna dati
+        env:
+          UPD: ${{ secrets.TOOLS_UPD }}
+          DOMAINS_JSON: ${{ secrets.TOOLS_DOMAINS_JSON }}
+        run: python "$RUNNER_TEMP/tools/$UPD" -o "$RUNNER_TEMP/tools/$DOMAINS_JSON"
+
+      # L'XML eventi è un intermedio: vive in $RUNNER_TEMP, mai committato.
+      - name: Genera eventi
+        env:
+          MAIN: ${{ secrets.TOOLS_MAIN }}
+          CLOUDFLARE_WORKER_URL: ${{ secrets.CLOUDFLARE_WORKER_URL }}
+          EPG: "on"
+        run: |
+          python "$RUNNER_TEMP/tools/$MAIN" --schedule \
+            --json "$RUNNER_TEMP/tools/s.json" \
+            -o "$RUNNER_TEMP/tools/o.m3u" \
+            --xml "$RUNNER_TEMP/tools/events.xml"
+
+      - name: Merge EPG
+        run: python epg.py --eventi-xml "$RUNNER_TEMP/tools/events.xml"
+
+      - name: Riepilogo
+        run: |
+          echo "Channels: $(grep -c '<channel ' epg.xml || true)"
+          echo "Programmes: $(grep -c '<programme ' epg.xml || true)"
+          ls -lh epg.xml epg.xml.gz
+
+      - name: Commit and push changes
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          git add epg.xml epg.xml.gz
+          git status --short
+          if git diff --quiet && git diff --staged --quiet; then
+            echo "Nessuna modifica da committare"
+            exit 0
+          fi
+          git commit -m "Update EPG - $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          for i in 1 2 3 4 5; do
+            git pull --rebase --autostash && git push && echo "Push riuscito al tentativo $i" && exit 0
+            echo "Tentativo $i fallito, riprovo tra 10 secondi..."
+            sleep 10
+          done
+          echo "Push fallito dopo 5 tentativi"
+          exit 1
