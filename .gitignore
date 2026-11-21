@@ -1,0 +1,25 @@
+# Secrets - MAI committare
+.env
+.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Ambienti virtuali
+.venv/
+venv/
+ENV/
+
+# macOS / Windows
+.DS_Store
+Thumbs.db
+
+# Log
+*.log
+
+# README locale: NON pubblicare
+README.md
+
+# (epg.xml e epg.xml.gz NON sono ignorati: quelli vanno pubblicati)
